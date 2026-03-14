@@ -1,0 +1,4 @@
+flask
+mistralai
+flask-cors
+gunicorn

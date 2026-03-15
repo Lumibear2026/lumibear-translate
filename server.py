@@ -3,6 +3,7 @@ from flask_cors import CORS
 from mistralai.client import Mistral
 import os
 import hashlib
+import json
 import time
 
 app = Flask(__name__)
@@ -12,8 +13,8 @@ API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 client = Mistral(api_key=API_KEY)
 MODEL = "mistral-large-latest"
 
-translation_cache = {}
-CACHE_DURATION = 86400
+CACHE_DIR = "/tmp/lumibear_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 LANGUAGES = {
     "it": "Italian", "en": "English", "fr": "French",
@@ -49,87 +50,136 @@ GLOSSARY_NO_TRANSLATE = [
 ]
 
 
+def get_cache(text, target_lang):
+    cache_key = hashlib.md5(f"{text}:{target_lang}".encode()).hexdigest()
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)['text']
+        except:
+            pass
+    return None
+
+
+def set_cache(text, target_lang, translated):
+    cache_key = hashlib.md5(f"{text}:{target_lang}".encode()).hexdigest()
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump({'text': translated, 'time': time.time()}, f, ensure_ascii=False)
+    except:
+        pass
+
+
 @app.route('/translate', methods=['POST'])
 def translate():
-    data = request.json
-    text = data['text']
-    target_lang = data['target_language']
-    source_lang = data.get('source_language', 'auto')
+    try:
+        data = request.json
+        text = data['text']
+        target_lang = data['target_language']
 
-    if target_lang not in LANGUAGES:
-        return jsonify({"error": f"Lingua '{target_lang}' non supportata"}), 400
+        if target_lang not in LANGUAGES:
+            return jsonify({"error": f"Lingua '{target_lang}' non supportata"}), 400
 
-    if not text.strip():
-        return jsonify({"translated_text": ""})
+        if not text.strip():
+            return jsonify({"translated_text": ""})
 
-    cache_key = hashlib.md5(f"{text}:{target_lang}".encode()).hexdigest()
-    if cache_key in translation_cache:
-        cached = translation_cache[cache_key]
-        if time.time() - cached['time'] < CACHE_DURATION:
-            return jsonify({"translated_text": cached['text'], "cached": True})
+        cached = get_cache(text, target_lang)
+        if cached:
+            return jsonify({"translated_text": cached, "cached": True})
 
-    terms = ", ".join(GLOSSARY_NO_TRANSLATE)
-    lang_name = LANGUAGES[target_lang]
+        terms = ", ".join(GLOSSARY_NO_TRANSLATE)
+        lang_name = LANGUAGES[target_lang]
 
-    response = client.chat.complete(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"Traduci il seguente testo in {lang_name}. "
-                    "Restituisci SOLO la traduzione, senza commenti. "
-                    "Mantieni la formattazione HTML se presente. "
-                    f"NON tradurre questi termini: {terms}"
-                )
-            },
-            {"role": "user", "content": text}
-        ],
-        temperature=0.1
-    )
+        response = client.chat.complete(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Traduci il seguente testo in {lang_name}. "
+                        "Restituisci SOLO la traduzione, senza commenti. "
+                        "Mantieni la formattazione HTML se presente. "
+                        f"NON tradurre questi termini: {terms}"
+                    )
+                },
+                {"role": "user", "content": text}
+            ],
+            temperature=0.1
+        )
 
-    translated_text = response.choices[0].message.content.strip()
-    translation_cache[cache_key] = {'text': translated_text, 'time': time.time()}
+        translated = response.choices[0].message.content.strip()
+        set_cache(text, target_lang, translated)
+        return jsonify({"translated_text": translated, "cached": False})
 
-    return jsonify({"translated_text": translated_text})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/translate-batch', methods=['POST'])
 def translate_batch():
-    data = request.json
-    texts = data.get('texts', [])
-    target_lang = data['target_language']
+    try:
+        data = request.json
+        texts = data.get('texts', [])
+        target_lang = data['target_language']
 
-    if not texts or target_lang not in LANGUAGES:
-        return jsonify({"error": "Parametri non validi"}), 400
+        if not texts or target_lang not in LANGUAGES:
+            return jsonify({"error": "Parametri non validi"}), 400
 
-    separator = "\n|||SEPARATOR|||\n"
-    combined = separator.join(texts)
-    lang_name = LANGUAGES[target_lang]
-    terms = ", ".join(GLOSSARY_NO_TRANSLATE)
+        results = [None] * len(texts)
+        to_translate = []
+        to_translate_idx = []
 
-    response = client.chat.complete(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"Traduci i seguenti testi in {lang_name}. "
-                    "Separati da |||SEPARATOR|||. "
-                    "Mantieni lo stesso separatore. "
-                    "Restituisci SOLO le traduzioni. "
-                    f"NON tradurre: {terms}"
-                )
-            },
-            {"role": "user", "content": combined}
-        ],
-        temperature=0.1
-    )
+        for i, text in enumerate(texts):
+            if not text.strip():
+                results[i] = ""
+                continue
+            cached = get_cache(text, target_lang)
+            if cached:
+                results[i] = cached
+            else:
+                to_translate.append(text)
+                to_translate_idx.append(i)
 
-    result = response.choices[0].message.content.strip()
-    translated_texts = [t.strip() for t in result.split("|||SEPARATOR|||")]
+        if to_translate:
+            separator = "\n|||SEPARATOR|||\n"
+            combined = separator.join(to_translate)
+            lang_name = LANGUAGES[target_lang]
+            terms = ", ".join(GLOSSARY_NO_TRANSLATE)
 
-    return jsonify({"translated_texts": translated_texts[:len(texts)]})
+            response = client.chat.complete(
+                model=MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Traduci i seguenti testi in {lang_name}. "
+                            "Separati da |||SEPARATOR|||. "
+                            "Mantieni lo stesso separatore. "
+                            "Restituisci SOLO le traduzioni. "
+                            f"NON tradurre: {terms}"
+                        )
+                    },
+                    {"role": "user", "content": combined}
+                ],
+                temperature=0.1
+            )
+
+            result = response.choices[0].message.content.strip()
+            translated_texts = [t.strip() for t in result.split("|||SEPARATOR|||")]
+
+            for j, idx in enumerate(to_translate_idx):
+                if j < len(translated_texts):
+                    results[idx] = translated_texts[j]
+                    set_cache(to_translate[j], target_lang, translated_texts[j])
+                else:
+                    results[idx] = to_translate[j]
+
+        return jsonify({"translated_texts": results})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/languages', methods=['GET'])
@@ -139,10 +189,21 @@ def languages():
 
 @app.route('/health', methods=['GET'])
 def health():
+    cache_count = len([f for f in os.listdir(CACHE_DIR) if f.endswith('.json')])
     return jsonify({
         "status": "ok",
         "service": "LumiBear Translate API",
         "model": MODEL,
         "languages": len(LANGUAGES),
+        "cached_translations": cache_count,
         "powered_by": "Mistral AI + Claude (Anthropic)"
+    })
+
+
+@app.route('/cache-stats', methods=['GET'])
+def cache_stats():
+    cache_count = len([f for f in os.listdir(CACHE_DIR) if f.endswith('.json')])
+    return jsonify({
+        "cached_translations": cache_count,
+        "cache_dir": CACHE_DIR
     })
